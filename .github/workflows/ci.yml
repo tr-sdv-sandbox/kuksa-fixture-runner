@@ -101,10 +101,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libssl3 \
-            libprotobuf32 \
-            libgrpc++1.51 \
-            libgoogle-glog0v6 \
-            docker.io
+            libprotobuf-dev \
+            libgrpc++-dev \
+            libgoogle-glog-dev
 
       - name: Run integration tests
         run: |
