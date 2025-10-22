@@ -20,14 +20,15 @@ target_include_directories(test_fixture_runner PRIVATE
 
 target_link_libraries(test_fixture_runner
     PRIVATE
-        kuksa_cpp
+        kuksa::cpp
+        vss::dag
         GTest::gtest
         GTest::gtest_main
         gRPC::grpc++
         protobuf::libprotobuf
         Threads::Threads
-        glog
-        nlohmann_json::nlohmann_json
+        glog::glog
+        yaml-cpp
 )
 
 # Register test with CTest

@@ -16,14 +16,13 @@
 #include <chrono>
 #include <memory>
 #include <fstream>
-#include <nlohmann/json.hpp>
+#include <yaml-cpp/yaml.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "kuksa_test_fixture.hpp"
 
 using namespace kuksa;
-using json = nlohmann::json;
 
 // Test signal paths
 constexpr const char* TEST_DOOR_ACTUATOR = "Vehicle.Cabin.Door.Row1.Left.IsLocked";
@@ -49,7 +48,7 @@ protected:
         resolver_ = std::move(*resolver_result);
 
         // Create test fixtures config file
-        fixtures_config_path_ = "/tmp/test_fixtures.json";
+        fixtures_config_path_ = "/tmp/test_fixtures.yaml";
     }
 
     void TearDown() override {
@@ -72,10 +71,10 @@ protected:
     /**
      * @brief Create a fixtures configuration file
      */
-    void CreateFixturesConfig(const json& fixtures) {
+    void CreateFixturesConfig(const YAML::Node& fixtures) {
         std::ofstream file(fixtures_config_path_);
         ASSERT_TRUE(file.is_open()) << "Failed to create fixtures config file";
-        file << fixtures.dump(2);
+        file << fixtures;
         file.close();
     }
 
@@ -108,6 +107,23 @@ protected:
         // Parent process - wait for fixture-runner to start
         LOG(INFO) << "Fixture-runner started with PID: " << fixture_runner_pid_;
         std::this_thread::sleep_for(std::chrono::seconds(2));
+
+        // Check if process is still alive (detect early exit due to errors)
+        int status;
+        pid_t result = waitpid(fixture_runner_pid_, &status, WNOHANG);
+        if (result > 0) {
+            // Process has exited
+            if (WIFEXITED(status)) {
+                int exit_code = WEXITSTATUS(status);
+                FAIL() << "Fixture-runner exited prematurely with exit code: " << exit_code;
+            } else if (WIFSIGNALED(status)) {
+                int signal = WTERMSIG(status);
+                FAIL() << "Fixture-runner killed by signal: " << signal;
+            }
+        } else if (result < 0) {
+            FAIL() << "waitpid failed: " << strerror(errno);
+        }
+        // result == 0 means process is still running (success)
     }
 
     /**
@@ -141,18 +157,23 @@ protected:
  * - Register as actuator provider
  */
 TEST_F(FixtureRunnerIntegrationTest, FixtureRunnerStartsAndRegisters) {
-    // Create fixtures config with one actuator
-    json config = {
-        {"fixtures", json::array({
-            {
-                {"type", "actuator_mirror"},
-                {"name", "Door Lock Fixture"},
-                {"target_signal", TEST_DOOR_ACTUATOR},
-                {"actual_signal", TEST_DOOR_ACTUATOR},
-                {"delay", 0.1}
-            }
-        })}
-    };
+    // Create fixture config with new schema
+    YAML::Node config;
+    YAML::Node fixture;
+    fixture["name"] = "Door Lock Fixture";
+
+    // Actuators this fixture serves
+    fixture["serves"].push_back(TEST_DOOR_ACTUATOR);
+
+    // DAG mapping: mirror actuator command to actual value with 100ms delay
+    YAML::Node mapping;
+    mapping["signal"] = TEST_DOOR_ACTUATOR;
+    mapping["depends_on"].push_back(TEST_DOOR_ACTUATOR);
+    mapping["datatype"] = "boolean";
+    mapping["transform"]["code"] = "delayed(deps[\"" + std::string(TEST_DOOR_ACTUATOR) + "\"], 100)";
+    fixture["mappings"].push_back(mapping);
+
+    config["fixture"] = fixture;
     CreateFixturesConfig(config);
 
     // Start fixture-runner
@@ -180,18 +201,23 @@ TEST_F(FixtureRunnerIntegrationTest, FixtureRunnerStartsAndRegisters) {
  * 4. Observer sees the actual value update
  */
 TEST_F(FixtureRunnerIntegrationTest, FixtureRunnerPublishesActualValue) {
-    // Create fixtures config
-    json config = {
-        {"fixtures", json::array({
-            {
-                {"type", "actuator_mirror"},
-                {"name", "Door Lock Fixture"},
-                {"target_signal", TEST_DOOR_ACTUATOR},
-                {"actual_signal", TEST_DOOR_ACTUATOR},
-                {"delay", 0.2}  // 200ms delay
-            }
-        })}
-    };
+    // Create fixture config
+    YAML::Node config;
+    YAML::Node fixture;
+    fixture["name"] = "Door Lock Fixture";
+
+    // Serve the actuator
+    fixture["serves"].push_back(TEST_DOOR_ACTUATOR);
+
+    // Mirror mapping with 200ms delay using delayed() function
+    YAML::Node mapping;
+    mapping["signal"] = TEST_DOOR_ACTUATOR;
+    mapping["depends_on"].push_back(TEST_DOOR_ACTUATOR);
+    mapping["datatype"] = "boolean";
+    mapping["transform"]["code"] = "delayed(deps[\"" + std::string(TEST_DOOR_ACTUATOR) + "\"], 200)";
+    fixture["mappings"].push_back(mapping);
+
+    config["fixture"] = fixture;
     CreateFixturesConfig(config);
 
     auto door_handle = *resolver_->get<bool>(TEST_DOOR_ACTUATOR);
@@ -201,10 +227,10 @@ TEST_F(FixtureRunnerIntegrationTest, FixtureRunnerPublishesActualValue) {
     std::atomic<int> update_count(0);
     std::atomic<bool> last_value(false);
 
-    observer->subscribe(door_handle, [&](std::optional<bool> value) {
-        if (value.has_value()) {
-            LOG(INFO) << "Observer received update: " << *value;
-            last_value = *value;
+    observer->subscribe(door_handle, [&](vss::types::QualifiedValue<bool> qv) {
+        if (qv.value.has_value()) {
+            LOG(INFO) << "Observer received update: " << *qv.value;
+            last_value = *qv.value;
             update_count++;
         }
     });
@@ -256,25 +282,32 @@ TEST_F(FixtureRunnerIntegrationTest, FixtureRunnerHandlesMultipleActuators) {
         GTEST_SKIP() << "HVAC actuator not available in VSS: " << hvac_handle_result.status();
     }
 
-    // Create fixtures config with multiple actuators
-    json config = {
-        {"fixtures", json::array({
-            {
-                {"type", "actuator_mirror"},
-                {"name", "Door Lock Fixture"},
-                {"target_signal", TEST_DOOR_ACTUATOR},
-                {"actual_signal", TEST_DOOR_ACTUATOR},
-                {"delay", 0.1}
-            },
-            {
-                {"type", "actuator_mirror"},
-                {"name", "HVAC Fixture"},
-                {"target_signal", TEST_HVAC_ACTUATOR},
-                {"actual_signal", TEST_HVAC_ACTUATOR},
-                {"delay", 0.15}
-            }
-        })}
-    };
+    // Create fixture config serving multiple actuators
+    YAML::Node config;
+    YAML::Node fixture;
+    fixture["name"] = "Multi-Actuator Fixture";
+
+    // Serve both actuators
+    fixture["serves"].push_back(TEST_DOOR_ACTUATOR);
+    fixture["serves"].push_back(TEST_HVAC_ACTUATOR);
+
+    // Door mapping
+    YAML::Node door_mapping;
+    door_mapping["signal"] = TEST_DOOR_ACTUATOR;
+    door_mapping["depends_on"].push_back(TEST_DOOR_ACTUATOR);
+    door_mapping["datatype"] = "boolean";
+    door_mapping["transform"]["code"] = "delayed(deps[\"" + std::string(TEST_DOOR_ACTUATOR) + "\"], 100)";
+    fixture["mappings"].push_back(door_mapping);
+
+    // HVAC mapping
+    YAML::Node hvac_mapping;
+    hvac_mapping["signal"] = TEST_HVAC_ACTUATOR;
+    hvac_mapping["depends_on"].push_back(TEST_HVAC_ACTUATOR);
+    hvac_mapping["datatype"] = "int32";
+    hvac_mapping["transform"]["code"] = "delayed(deps[\"" + std::string(TEST_HVAC_ACTUATOR) + "\"], 150)";
+    fixture["mappings"].push_back(hvac_mapping);
+
+    config["fixture"] = fixture;
     CreateFixturesConfig(config);
 
     auto door_handle = *resolver_->get<bool>(TEST_DOOR_ACTUATOR);
@@ -285,14 +318,14 @@ TEST_F(FixtureRunnerIntegrationTest, FixtureRunnerHandlesMultipleActuators) {
     std::atomic<int> door_updates(0);
     std::atomic<int> hvac_updates(0);
 
-    observer->subscribe(door_handle, [&](std::optional<bool> value) {
-        if (value.has_value()) {
+    observer->subscribe(door_handle, [&](vss::types::QualifiedValue<bool> qv) {
+        if (qv.value.has_value()) {
             door_updates++;
         }
     });
 
-    observer->subscribe(hvac_handle, [&](std::optional<int32_t> value) {
-        if (value.has_value()) {
+    observer->subscribe(hvac_handle, [&](vss::types::QualifiedValue<int32_t> qv) {
+        if (qv.value.has_value()) {
             hvac_updates++;
         }
     });
@@ -331,17 +364,20 @@ TEST_F(FixtureRunnerIntegrationTest, FixtureRunnerHandlesMultipleActuators) {
  */
 TEST_F(FixtureRunnerIntegrationTest, FixtureRunnerRespectsConfiguredDelay) {
     // Create fixture with 500ms delay
-    json config = {
-        {"fixtures", json::array({
-            {
-                {"type", "actuator_mirror"},
-                {"name", "Slow Door Fixture"},
-                {"target_signal", TEST_DOOR_ACTUATOR},
-                {"actual_signal", TEST_DOOR_ACTUATOR},
-                {"delay", 0.5}  // 500ms delay
-            }
-        })}
-    };
+    YAML::Node config;
+    YAML::Node fixture;
+    fixture["name"] = "Slow Door Fixture";
+
+    fixture["serves"].push_back(TEST_DOOR_ACTUATOR);
+
+    YAML::Node mapping;
+    mapping["signal"] = TEST_DOOR_ACTUATOR;
+    mapping["depends_on"].push_back(TEST_DOOR_ACTUATOR);
+    mapping["datatype"] = "boolean";
+    mapping["transform"]["code"] = "delayed(deps[\"" + std::string(TEST_DOOR_ACTUATOR) + "\"], 500)";  // 500ms delay
+    fixture["mappings"].push_back(mapping);
+
+    config["fixture"] = fixture;
     CreateFixturesConfig(config);
 
     auto door_handle = *resolver_->get<bool>(TEST_DOOR_ACTUATOR);
@@ -351,8 +387,8 @@ TEST_F(FixtureRunnerIntegrationTest, FixtureRunnerRespectsConfiguredDelay) {
     std::chrono::steady_clock::time_point update_time;
     std::mutex time_mutex;
 
-    observer->subscribe(door_handle, [&](std::optional<bool> value) {
-        if (value.has_value()) {
+    observer->subscribe(door_handle, [&](vss::types::QualifiedValue<bool> qv) {
+        if (qv.value.has_value()) {
             std::lock_guard<std::mutex> lock(time_mutex);
             update_time = std::chrono::steady_clock::now();
             update_count++;
@@ -394,6 +430,117 @@ TEST_F(FixtureRunnerIntegrationTest, FixtureRunnerRespectsConfiguredDelay) {
     // Allow some margin for processing time
     EXPECT_GE(elapsed, 450) << "Update came too fast (delay not respected)";
     EXPECT_LE(elapsed, 1000) << "Update took too long";
+
+    observer->stop();
+}
+
+/**
+ * @brief Test: Cross-signal fixture effects with automatic type widening
+ *
+ * Tests that one actuator can affect a different signal with compatible types.
+ * Demonstrates automatic type widening (int8 → int32).
+ */
+TEST_F(FixtureRunnerIntegrationTest, FixtureCrossSignalEffect) {
+    // Use int8 actuator affecting int32 actuator (compatible types - auto widening)
+    constexpr const char* ACTUATOR_SIGNAL = "Vehicle.Private.Test.Int8Actuator";
+    constexpr const char* AFFECTED_SIGNAL = "Vehicle.Private.Test.Int32Actuator";
+
+    // Create fixture where actuating one signal affects another
+    YAML::Node config;
+    YAML::Node fixture;
+    fixture["name"] = "Cross-Signal Test Fixture";
+
+    // Serve both actuators
+    fixture["serves"].push_back(ACTUATOR_SIGNAL);
+    fixture["serves"].push_back(AFFECTED_SIGNAL);
+
+    // Mapping 1: int8 → int32 (cross-signal with auto-widening)
+    YAML::Node mapping1;
+    mapping1["signal"] = AFFECTED_SIGNAL;
+    mapping1["depends_on"].push_back(ACTUATOR_SIGNAL);
+    mapping1["datatype"] = "int32";
+    mapping1["transform"]["code"] = "delayed(deps[\"" + std::string(ACTUATOR_SIGNAL) + "\"], 300)";
+    fixture["mappings"].push_back(mapping1);
+
+    // Mapping 2: Mirror actuator to itself (with narrowing support)
+    YAML::Node mapping2;
+    mapping2["signal"] = ACTUATOR_SIGNAL;
+    mapping2["depends_on"].push_back(ACTUATOR_SIGNAL);
+    mapping2["datatype"] = "int8";
+    mapping2["transform"]["code"] = "delayed(deps[\"" + std::string(ACTUATOR_SIGNAL) + "\"], 100)";
+    fixture["mappings"].push_back(mapping2);
+
+    config["fixture"] = fixture;
+    CreateFixturesConfig(config);
+
+    auto actuator_handle = *resolver_->get<int8_t>(ACTUATOR_SIGNAL);
+    auto affected_handle = *resolver_->get<int32_t>(AFFECTED_SIGNAL);
+
+    // Create observer for the affected signal
+    auto observer = std::move(*Client::create(getKuksaAddress()));
+    std::atomic<int> affected_updates(0);
+    std::atomic<int32_t> affected_value(0);
+    std::atomic<int> actuator_updates(0);
+
+    // Subscribe to the affected signal (int32)
+    observer->subscribe(affected_handle, [&](vss::types::QualifiedValue<int32_t> qv) {
+        if (qv.value.has_value()) {
+            LOG(INFO) << "Affected signal (int32) received update: " << *qv.value;
+            affected_value = *qv.value;
+            affected_updates++;
+        }
+    });
+
+    // Also subscribe to the actuator signal to see both updates (int8)
+    observer->subscribe(actuator_handle, [&](vss::types::QualifiedValue<int8_t> qv) {
+        if (qv.value.has_value()) {
+            LOG(INFO) << "Actuator signal (int8) received update: " << static_cast<int>(*qv.value);
+            actuator_updates++;
+        }
+    });
+
+    observer->start();
+    observer->wait_until_ready(std::chrono::seconds(5));
+
+    // Wait for initial subscription updates
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    int initial_affected = affected_updates.load();
+    int initial_actuator = actuator_updates.load();
+    LOG(INFO) << "Initial updates - Affected: " << initial_affected
+              << ", Actuator: " << initial_actuator;
+
+    // Start fixture-runner
+    StartFixtureRunner();
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    // Create commander
+    auto commander = std::move(*Client::create(getKuksaAddress()));
+
+    // Send actuation command to the actuator signal (int8 = 42)
+    LOG(INFO) << "Sending actuation command to " << ACTUATOR_SIGNAL << " = 42";
+    auto status = commander->set(actuator_handle, static_cast<int8_t>(42));
+    ASSERT_TRUE(status.ok()) << "Failed to send actuation: " << status;
+
+    // Wait for both effects to be published
+    // Effect 1 (affected signal) has 300ms delay
+    // Effect 2 (actuator signal) has 100ms delay
+    ASSERT_TRUE(wait_for([&]() {
+        return affected_updates.load() > initial_affected;
+    }, std::chrono::seconds(5)))
+        << "Affected signal (int32) did not receive update within timeout";
+
+    ASSERT_TRUE(wait_for([&]() {
+        return actuator_updates.load() > initial_actuator;
+    }, std::chrono::seconds(5)))
+        << "Actuator signal (int8) did not receive update within timeout";
+
+    // Verify the cross-signal effect worked with automatic type widening
+    // int8(42) should be automatically widened to int32(42)
+    EXPECT_EQ(affected_value.load(), 42)
+        << "Cross-signal effect: int32 actuator should be 42 when int8 actuator is 42 (auto-widening)";
+
+    LOG(INFO) << "Cross-signal fixture test passed with automatic type widening!";
+    LOG(INFO) << "Actuated: " << ACTUATOR_SIGNAL << " (int8=42) → Affected: " << AFFECTED_SIGNAL << " (int32=42)";
 
     observer->stop();
 }

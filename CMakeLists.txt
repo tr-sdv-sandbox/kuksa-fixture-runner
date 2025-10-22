@@ -8,46 +8,51 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Threads REQUIRED)
 find_package(Protobuf REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
+find_package(glog REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
-# SDK path - check if SDK is installed or needs to be built from source
-if(EXISTS "/usr/local/lib/libkuksa_cpp.a")
-    # Production mode - SDK is pre-installed (Docker)
-    message(STATUS "Using pre-installed SDK from /usr/local")
-    set(SDK_INCLUDE_DIR /usr/local/include)
-    # Import the pre-installed library
-    add_library(kuksa_cpp STATIC IMPORTED)
-    set_target_properties(kuksa_cpp PROPERTIES
-        IMPORTED_LOCATION /usr/local/lib/libkuksa_cpp.a
-        INTERFACE_INCLUDE_DIRECTORIES /usr/local/include
-    )
-else()
-    # Development mode - build SDK from source
-    if(NOT DEFINED SDK_PATH)
-        # Check local path first
-        set(LOCAL_SDK_PATH "$ENV{HOME}/tr-sdv-sandbox/libkuksa-cpp")
-        if(EXISTS "${LOCAL_SDK_PATH}/CMakeLists.txt")
-            set(SDK_PATH "${LOCAL_SDK_PATH}")
-            message(STATUS "Found local SDK at: ${SDK_PATH}")
-        else()
-            # Download from GitHub if not found locally
-            message(STATUS "Local SDK not found, downloading from GitHub")
-            include(FetchContent)
-            FetchContent_Declare(
-                libkuksa_cpp
-                GIT_REPOSITORY https://github.com/tr-sdv-sandbox/libkuksa-cpp.git
-                GIT_TAG main
-            )
-            FetchContent_MakeAvailable(libkuksa_cpp)
-            set(SDK_PATH "${libkuksa_cpp_SOURCE_DIR}")
-        endif()
+# Try to find libvss-types first (shared dependency)
+find_package(vss-types QUIET)
+if(NOT vss-types_FOUND)
+    # Check parent directory for development
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../libvss-types/CMakeLists.txt")
+        message(STATUS "Found libvss-types in parent directory")
+        add_subdirectory(../libvss-types ${CMAKE_BINARY_DIR}/libvss-types)
+    else()
+        message(STATUS "libvss-types not found, will be fetched by dependencies")
     endif()
-    message(STATUS "Building SDK from source: ${SDK_PATH}")
-    set(WITH_STATE_MACHINE OFF CACHE BOOL "Disable state machine" FORCE)
-    set(BUILD_TESTS OFF CACHE BOOL "Disable SDK tests" FORCE)
-    set(BUILD_EXAMPLES OFF CACHE BOOL "Disable SDK examples" FORCE)
-    add_subdirectory(${SDK_PATH} ${CMAKE_CURRENT_BINARY_DIR}/sdk)
-    set(SDK_INCLUDE_DIR ${SDK_PATH}/include)
 endif()
+
+# Find or add libvssdag
+find_package(vssdag QUIET)
+if(NOT vssdag_FOUND)
+    # Check parent directory for development
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../libvssdag/CMakeLists.txt")
+        message(STATUS "Using libvssdag from parent directory")
+        set(BUILD_EXAMPLES OFF CACHE BOOL "Don't build vssdag examples" FORCE)
+        set(BUILD_TESTS OFF CACHE BOOL "Don't build vssdag tests" FORCE)
+        set(BUILD_INTEGRATION_TESTS OFF CACHE BOOL "Don't build vssdag integration tests" FORCE)
+        add_subdirectory(../libvssdag ${CMAKE_BINARY_DIR}/libvssdag)
+    else()
+        message(FATAL_ERROR "libvssdag not found. Please install it or place it in parent directory.")
+    endif()
+endif()
+
+# Find or add libkuksa-cpp
+find_package(kuksa_cpp QUIET)
+if(NOT kuksa_cpp_FOUND)
+    # Check parent directory for development
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../libkuksa-cpp/CMakeLists.txt")
+        message(STATUS "Using libkuksa-cpp from parent directory")
+        set(BUILD_EXAMPLES OFF CACHE BOOL "Don't build kuksa-cpp examples" FORCE)
+        set(BUILD_TESTS OFF CACHE BOOL "Don't build kuksa-cpp tests" FORCE)
+        add_subdirectory(../libkuksa-cpp ${CMAKE_BINARY_DIR}/libkuksa-cpp)
+    else()
+        message(FATAL_ERROR "libkuksa-cpp not found. Please install it or place it in parent directory.")
+    endif()
+endif()
+
+set(SDK_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../libkuksa-cpp/include)
 
 # JSON library - prefer system package, fallback to FetchContent
 find_package(nlohmann_json 3.11.0 QUIET)
@@ -77,12 +82,13 @@ target_include_directories(fixture-runner PRIVATE
 # Link libraries
 target_link_libraries(fixture-runner
     PRIVATE
-        kuksa_cpp
+        kuksa::cpp
+        vss::dag
         gRPC::grpc++
         protobuf::libprotobuf
         Threads::Threads
-        glog
-        nlohmann_json::nlohmann_json
+        glog::glog
+        yaml-cpp
 )
 
 # Add tests

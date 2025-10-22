@@ -106,6 +106,11 @@ protected:
                 "datatype": "boolean",
                 "description": "Test bool actuator"
               },
+              "Int8Actuator": {
+                "type": "actuator",
+                "datatype": "int8",
+                "description": "Test int8 actuator"
+              },
               "Int32Actuator": {
                 "type": "actuator",
                 "datatype": "int32",
@@ -115,6 +120,11 @@ protected:
                 "type": "sensor",
                 "datatype": "float",
                 "description": "Test float sensor"
+              },
+              "DoubleSensor": {
+                "type": "sensor",
+                "datatype": "double",
+                "description": "Test double sensor"
               }
             }
           }
